@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- $Id: dc-dc.xml 246 2014-12-18 15:41:55Z wydrych $ -->
+<flows>
+    <flow-inter-arrival-time distribution="exponential">
+        <param name="mean" value="2530" />
+    </flow-inter-arrival-time>
+    <flow-template weight="0.5">
+        <destinations>
+            <destination weight="0.2" address="10.0.0.4" min-port="10000" max-port="39999" />
+            <destination weight="0.5" address="10.0.0.1" min-port="10000" max-port="39999" />
+            <destination weight="0.3" address="10.0.0.3" min-port="10000" max-port="39999" />
+        </destinations>
+        <flow-length distribution="lognormal">
+            <param name="mu" value="10.7" />
+			<param name="sigma" value="1.01" />
+        </flow-length>
+        <packet-inter-arrival-time distribution="exponential">
+            <param name="mean" value="10" />
+        </packet-inter-arrival-time>
+        <payload-size distribution="normal">
+            <param name="mu" value="1358" />
+            <param name="sigma" value="25" />
+        </payload-size>
+        <payload type="zero" />
+    </flow-template>
+    <flow-template weight="0.5">
+        <destinations>
+            <destination weight="0.2" address="10.0.0.4" min-port="10000" max-port="39999" />
+            <destination weight="0.5" address="10.0.0.1" min-port="10000" max-port="39999" />
+            <destination weight="0.3" address="10.0.0.3" min-port="10000" max-port="39999" />
+        </destinations>
+       <flow-length distribution="lognormal">
+            <param name="mu" value="10.7" />
+			<param name="sigma" value="1.01" />
+        </flow-length>
+        <packet-inter-arrival-time distribution="exponential">
+            <param name="mean" value="10" />
+        </packet-inter-arrival-time>
+        <payload-size distribution="normal">
+            <param name="mu" value="158" />
+            <param name="sigma" value="20" />
+        </payload-size>
+        <payload type="zero" />
+    </flow-template>
+</flows>
