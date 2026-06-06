@@ -5,7 +5,7 @@ import time
 import os
 
 from mininet.log import setLogLevel
-from mininet.net import Mininet
+from mininet.net import Mininet, CLI
 from mininet.node import RemoteController
 
 from topology.polska_4_hosts import Polska
@@ -13,16 +13,19 @@ from metrics.collector import MetricsCollector
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 RESULTS_DIR = "results/mpls_cached/"
+LOGS_DIR = "results/mpls_cached/logs"
 os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 PE_SWITCHES = ["Gdansk", "Rzeszow", "Wroclaw", "Szczecin"]
 
 
-def start_ryu():
+def start_ryu(env):
     return subprocess.Popen(
         ["ryu-manager", "mpls_controller_cached.py", "--observe-links"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        # stdout=subprocess.DEVNULL,
+        # stderr=subprocess.DEVNULL,
+        env=env,
     )
 
 
@@ -93,20 +96,32 @@ def run_experiment(run_id):
     finally:
         net.stop()
 
+def run_cli():
+    net = setup_network()
+
+    try:
+        hosts = start_traffic(net)
+        CLI(net)
+    finally:
+        net.stop()
+
 
 if __name__ == "__main__":
     setLogLevel("info")
 
-    RUNS = 2
+    RUNS = 3
 
     for run_id in range(1, RUNS + 1):
+        env = os.environ.copy()
+        env["RUN_ID"] = str(run_id)
+
         print(f"\n=== RUN {run_id} ===\n")
 
         subprocess.run(["sudo", "mn", "-c"])
 
         time.sleep(5)
 
-        ryu_proc = start_ryu()
+        ryu_proc = start_ryu(env)
 
         time.sleep(8)
 
@@ -117,3 +132,9 @@ if __name__ == "__main__":
             stop_ryu(ryu_proc)
 
     subprocess.run(["sudo", "mn", "-c"])
+
+    # ryu_proc = start_ryu()
+    # run_cli()
+    # stop_ryu(ryu_proc)
+
+    # subprocess.run(["sudo", "mn", "-c"])

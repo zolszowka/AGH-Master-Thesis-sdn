@@ -1,16 +1,19 @@
-from collections import defaultdict, deque
 import heapq
+import logging
+import os
 import time
-from typing import Dict, List, Tuple, Any, Set, Optional, DefaultDict, Deque
+from collections import defaultdict, deque
+from typing import Any, DefaultDict, Deque, Dict, List, Optional, Set, Tuple
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, arp
-from ryu.topology.api import get_link
 from ryu.lib import hub
+from ryu.lib.packet import arp, ethernet, packet
+from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event
+from ryu.topology.api import get_link
+
 
 MAX_BW = 100.0
 WARN_TH = 0.4 * MAX_BW
@@ -27,6 +30,9 @@ PRIO_MPLS = 1000
 PRIO_ARP = 100
 PRIO_POP = 500
 PRIO_MISS = 0
+
+LOGS_DIR = "results/mpls_cached/logs"
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 
 class MplsControllerCached(app_manager.RyuApp):
@@ -60,6 +66,12 @@ class MplsControllerCached(app_manager.RyuApp):
         self.label_to_path_info: Dict[int, Dict[str, Any]] = {}
 
         hub.spawn(self._monitor_stats)
+
+        run_id = os.environ.get("RUN_ID", "0")
+        log_file = os.path.join(LOGS_DIR, f"stats_mpls_cached_{run_id}.log")
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        self.logger.addHandler(fh)
 
     # -----------------------------------------------------------------------
     # Ryu event handlers
@@ -145,7 +157,6 @@ class MplsControllerCached(app_manager.RyuApp):
         now = time.time()
         for stat in msg.body:
             port_no = stat.port_no
-
             if port_no > ofproto.OFPP_MAX:
                 continue
 
@@ -165,6 +176,12 @@ class MplsControllerCached(app_manager.RyuApp):
                 continue
 
             throughput_bps = (dbytes * 8.0) / dt
+
+            throughput_mbps = (dbytes * 8.0) / (dt * 1e6)
+            self.logger.info(
+                f"STATS dpid={dpid} port={port_no} "
+                f"throughput={throughput_mbps:.3f} Mbps"
+            )
 
             changed_links.extend(
                 self._update_link_states(dpid, port_no, throughput_bps)
@@ -191,7 +208,7 @@ class MplsControllerCached(app_manager.RyuApp):
             )
 
             if dpid not in self.egress_pop_installed:
-                self._install_egress_pop_rule(dpid, in_port)
+                self._install_pe_pop(dpid, in_port)
 
             self._recalculate_paths()
 
@@ -498,11 +515,24 @@ class MplsControllerCached(app_manager.RyuApp):
         dst_dpid: int,
         path: List[int],
     ) -> None:
-        label = self.mpls_label
-        self.mpls_label += 1
-
         stitch_node, reuse_label = self._find_reuseable_segment(path, dst_dpid)
         stitch_idx = path.index(stitch_node) if stitch_node else None
+
+        if reuse_label is not None and stitch_node is None:
+            self.logger.info(
+                f"Full reuse of label {reuse_label} for {src_ip}->{dst_ip}: {path}"
+            )
+            self.path_cache[(src_dpid, dst_dpid)] = {
+                "path": path,
+                "label": reuse_label,
+                "stitch_idx": None,
+                "reuse_label": None,
+            }
+            self._install_pe_push(path, src_ip, dst_ip, reuse_label)
+            return
+
+        label = self.mpls_label
+        self.mpls_label += 1
 
         self.path_cache[(src_dpid, dst_dpid)] = {
             "path": path,
@@ -512,9 +542,7 @@ class MplsControllerCached(app_manager.RyuApp):
         }
 
         self.label_to_path_info[label] = {"path": path, "stitch_idx": stitch_idx}
-
-        if label not in self.label_refcount:
-            self.label_refcount[label] = 1
+        self.label_refcount[label] = 1
 
         self.logger.info(f"New path {src_ip}->{dst_ip}: {path}, MPLS label={label}")
 
@@ -522,7 +550,7 @@ class MplsControllerCached(app_manager.RyuApp):
             self.label_refcount[reuse_label] += 1
             self.logger.info(f"Reusing label {reuse_label} from node {stitch_node}")
             self._install_mpls_path_with_stitch(
-                path, src_ip, dst_ip, label, stitch_node, reuse_label
+                path, src_ip, dst_ip, label, stitch_idx, reuse_label
             )
         else:
             self._install_mpls_path(path, src_ip, dst_ip, label)
@@ -566,6 +594,12 @@ class MplsControllerCached(app_manager.RyuApp):
                 if cand_stitch_idx is not None and cand_match_idx >= cand_stitch_idx:
                     continue
 
+                if stitch_idx == 0 and match_len > best_len:
+                    best_len = match_len
+                    best_stitch = None
+                    best_label = label
+                    continue
+
                 if stitch_idx > 0 and match_len > best_len:
                     best_len = match_len
                     best_stitch = new_path[stitch_idx]
@@ -605,21 +639,41 @@ class MplsControllerCached(app_manager.RyuApp):
     def _install_mpls_path(
         self, path: List[int], src_ip: str, dst_ip: str, label: int
     ) -> None:
-        # Transit P nodes
         for i in range(len(path) - 2, 0, -1):
-            dpid = path[i]
-            dp = self.datapaths[dpid]
-            ofproto = dp.ofproto
-            parser = dp.ofproto_parser
+            self._install_p_forward(path, i, label)
+        self._install_pe_push(path, src_ip, dst_ip, label)
 
-            match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=label)
-            actions = [parser.OFPActionOutput(self.neigh[dpid][path[i + 1]])]
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-            self._add_flow(
-                dp=dp, table_id=0, priority=PRIO_MPLS, match=match, instructions=inst
-            )
+    def _install_mpls_path_with_stitch(
+        self,
+        path: List[int],
+        src_ip: str,
+        dst_ip: str,
+        new_label: int,
+        stitch_idx: int,
+        reuse_label: int,
+    ) -> None:
+        # Stitch node
+        dpid = path[stitch_idx]
+        dp = self.datapaths[dpid]
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
+        match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=new_label)
+        actions = [
+            parser.OFPActionSetField(mpls_label=reuse_label),
+            parser.OFPActionOutput(self.neigh[dpid][path[stitch_idx + 1]]),
+        ]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        self._add_flow(
+            dp=dp, table_id=0, priority=PRIO_MPLS, match=match, instructions=inst
+        )
 
-        # Ingress PE node
+        for i in range(stitch_idx - 1, 0, -1):
+            self._install_p_forward(path, i, new_label)
+        self._install_pe_pop(path, src_ip, dst_ip, new_label)
+
+    def _install_pe_push(
+        self, path: List[int], src_ip: str, dst_ip: str, label: int
+    ) -> None:
         dpid = path[0]
         dp = self.datapaths[dpid]
         ofproto = dp.ofproto
@@ -635,63 +689,19 @@ class MplsControllerCached(app_manager.RyuApp):
             dp=dp, table_id=1, priority=PRIO_MPLS, match=match, instructions=inst
         )
 
-    def _install_mpls_path_with_stitch(
-        self,
-        path: List[int],
-        src_ip: str,
-        dst_ip: str,
-        new_label: int,
-        stitch_node: int,
-        reuse_label: int,
-    ) -> None:
-        stitch_idx = path.index(stitch_node)
-
-        # Stitch node
-        dpid = stitch_node
+    def _install_p_forward(self, path: List[int], i: int, label: int) -> None:
+        dpid = path[i]
         dp = self.datapaths[dpid]
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
-        match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=new_label)
-        actions = [
-            parser.OFPActionSetField(mpls_label=reuse_label),
-            parser.OFPActionOutput(self.neigh[dpid][path[stitch_idx + 1]]),
-        ]
+        match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=label)
+        actions = [parser.OFPActionOutput(self.neigh[dpid][path[i + 1]])]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         self._add_flow(
             dp=dp, table_id=0, priority=PRIO_MPLS, match=match, instructions=inst
         )
 
-        # Transit P nodes
-        for i in range(stitch_idx - 1, 0, -1):
-            dpid = path[i]
-            dp = self.datapaths[dpid]
-            ofproto = dp.ofproto
-            parser = dp.ofproto_parser
-
-            match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=new_label)
-            actions = [parser.OFPActionOutput(self.neigh[dpid][path[i + 1]])]
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-            self._add_flow(
-                dp=dp, table_id=0, priority=PRIO_MPLS, match=match, instructions=inst
-            )
-
-        # Ingress PE node
-        dpid = path[0]
-        dp = self.datapaths[dpid]
-        ofproto = dp.ofproto
-        parser = dp.ofproto_parser
-        match = parser.OFPMatch(eth_type=ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip)
-        actions = [
-            parser.OFPActionPushMpls(),
-            parser.OFPActionSetField(mpls_label=new_label),
-            parser.OFPActionOutput(self.neigh[dpid][path[1]]),
-        ]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        self._add_flow(
-            dp=dp, table_id=1, priority=PRIO_MPLS, match=match, instructions=inst
-        )
-
-    def _install_egress_pop_rule(self, dpid: int, host_port: int) -> None:
+    def _install_pe_pop(self, dpid: int, host_port: int) -> None:
         dp = self.datapaths[dpid]
         ofproto = dp.ofproto
         parser = dp.ofproto_parser

@@ -1,6 +1,3 @@
-import time
-
-
 class ThroughputMonitor:
     def __init__(self):
         self.prev_tx = None

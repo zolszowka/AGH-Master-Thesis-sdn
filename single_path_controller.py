@@ -1,12 +1,18 @@
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import networkx as nx
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.lib import hub
+from ryu.lib.packet import arp, ethernet, ipv4, packet, udp
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, arp, ipv4, udp
 from ryu.topology import event
 from ryu.topology.api import get_link
-from typing import Dict, List, Tuple, Any, Optional
 
 
 ETH_TYPE_IP = 0x0800
@@ -16,6 +22,11 @@ ETH_TYPE_MPLS = 0x8847
 PRIO_UDP = 1000
 PRIO_ICMP = 500
 PRIO_MISS = 0
+
+INTERVAL = 5.0
+
+LOGS_DIR = "results/single_path/logs"
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 
 class SinglePathController(app_manager.RyuApp):
@@ -27,6 +38,14 @@ class SinglePathController(app_manager.RyuApp):
         self.hosts: Dict[str, Tuple[int, int, str]] = {}  # {ip: (dpid, port, mac)}
         self.neigh: Dict[int, Dict[int, int]] = {}  # {dpid: {neighbor_dpid: port}}
         self.net = nx.Graph()
+
+        hub.spawn(self._monitor_stats)
+
+        run_id = os.environ.get("RUN_ID", "0")
+        log_file = os.path.join(LOGS_DIR, f"stats_single_path_{run_id}.log")
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        self.logger.addHandler(fh)
 
     # -----------------------------------------------------------------------
     # Ryu event handlers
@@ -97,6 +116,40 @@ class SinglePathController(app_manager.RyuApp):
             return
         self.neigh = new_neigh
         self.net = new_net
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply_handler(self, ev: ofp_event.EventOFPPortStatsReply) -> None:
+        msg = ev.msg
+        dp = msg.datapath
+        dpid = dp.id
+        ofproto = dp.ofproto
+
+        now = time.time()
+        for stat in msg.body:
+            port_no = stat.port_no
+            if port_no > ofproto.OFPP_MAX:
+                continue
+
+            key = (dpid, port_no)
+            total = stat.tx_bytes
+            last = self.port_stats.get(key)
+            self.port_stats[key] = (total, now)
+
+            if last is None:
+                continue
+
+            prev_bytes, prev_time = last
+            dt = now - prev_time
+            dbytes = total - prev_bytes
+
+            if dt <= 0 or dbytes <= 0:
+                continue
+
+            throughput_mbps = (dbytes * 8.0) / (dt * 1e6)
+            self.logger.info(
+                f"STATS dpid={dpid} port={port_no} "
+                f"throughput={throughput_mbps:.3f} Mbps"
+            )
 
     # -----------------------------------------------------------------------
     # ARP and Host Discovery
@@ -234,8 +287,7 @@ class SinglePathController(app_manager.RyuApp):
 
         if dpid == src_dpid:
             self._install_udp_path(path, src_ip, dst_ip, src_udp, dst_udp, dst_port)
-
-        self._forward_packet(msg, path, dst_port)
+            self._forward_packet(msg, path, dst_port)
 
     def _forward_packet(self, msg: Any, path: List[int], final_port: int) -> None:
         dp = msg.datapath
@@ -299,9 +351,7 @@ class SinglePathController(app_manager.RyuApp):
         dst_port: int,
         final_port: int,
     ) -> None:
-        datapath_list = []
-
-        for i in range(len(path)):
+        for i in range(len(path) - 1, -1, -1):
             dpid = path[i]
             dp = self.datapaths[dpid]
             ofproto = dp.ofproto
@@ -331,12 +381,6 @@ class SinglePathController(app_manager.RyuApp):
                 instructions=inst,
                 idle_timeout=30,
             )
-            datapath_list.append(dp)
-
-        for dp in datapath_list:
-            parser = dp.ofproto_parser
-            barrier = parser.OFPBarrierRequest(dp)
-            dp.send_msg(barrier)
 
     def _add_flow(
         self,
@@ -357,3 +401,23 @@ class SinglePathController(app_manager.RyuApp):
             instructions=instructions,
         )
         dp.send_msg(mod)
+
+    # -----------------------------------------------------------------------
+    # Network Monitoring and Link State
+    # -----------------------------------------------------------------------
+
+    def _monitor_stats(self) -> None:
+        while True:
+            for dp in self.datapaths.values():
+                self._request_port_stats(dp)
+            hub.sleep(INTERVAL)
+
+    def _request_port_stats(self, dp: Any) -> None:
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
+
+        try:
+            req = parser.OFPPortStatsRequest(dp, 0, ofproto.OFPP_ANY)
+            dp.send_msg(req)
+        except Exception as e:
+            self.logger.exception(f"PortStatsRequest error: {e}")

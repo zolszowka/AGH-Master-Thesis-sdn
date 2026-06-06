@@ -1,16 +1,19 @@
-from collections import defaultdict
 import heapq
+import logging
+import os
 import time
-from typing import Dict, List, Tuple, Any, Set, Optional
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, arp
-from ryu.topology.api import get_link
 from ryu.lib import hub
+from ryu.lib.packet import arp, ethernet, packet
+from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event
+from ryu.topology.api import get_link
+
 
 MAX_BW = 100.0
 WARN_TH = 0.4 * MAX_BW
@@ -26,6 +29,9 @@ PRIO_MPLS = 1000
 PRIO_ARP = 100
 PRIO_POP = 500
 PRIO_MISS = 0
+
+LOGS_DIR = "results/mpls_basic/logs"
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 
 class MplsControllerBasic(app_manager.RyuApp):
@@ -53,6 +59,12 @@ class MplsControllerBasic(app_manager.RyuApp):
         ] = {}  # {(src, dst): {'state': 'NORM', 'throughput_bps': 0.0}}
 
         hub.spawn(self._monitor_stats)
+
+        run_id = os.environ.get("RUN_ID", "0")
+        log_file = os.path.join(LOGS_DIR, f"stats_mpls_basic_{run_id}.log")
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        self.logger.addHandler(fh)
 
     # -----------------------------------------------------------------------
     # Ryu event handlers
@@ -159,6 +171,12 @@ class MplsControllerBasic(app_manager.RyuApp):
 
             throughput_bps = (dbytes * 8.0) / dt
 
+            throughput_mbps = (dbytes * 8.0) / (dt * 1e6)
+            self.logger.info(
+                f"STATS dpid={dpid} port={port_no} "
+                f"throughput={throughput_mbps:.3f} Mbps"
+            )
+
             changed_links.extend(
                 self._update_link_states(dpid, port_no, throughput_bps)
             )
@@ -184,7 +202,7 @@ class MplsControllerBasic(app_manager.RyuApp):
             )
 
             if dpid not in self.egress_pop_installed:
-                self._install_egress_pop_rule(dpid, in_port)
+                self._install_pe_pop(dpid, in_port)
 
             self._recalculate_paths()
 
@@ -317,6 +335,7 @@ class MplsControllerBasic(app_manager.RyuApp):
 
     def _classify_state(self, throughput_bps: float) -> str:
         throughput_mbps = throughput_bps / 1e6
+        self.logger.info(f"{throughput_mbps} Mbps")
         if throughput_mbps >= CONG_TH:
             return "CONG"
         if throughput_mbps >= WARN_TH:
@@ -518,7 +537,6 @@ class MplsControllerBasic(app_manager.RyuApp):
                 old_path_data["path"],
             )
 
-
     # -----------------------------------------------------------------------
     # Flow installation
     # -----------------------------------------------------------------------
@@ -526,21 +544,13 @@ class MplsControllerBasic(app_manager.RyuApp):
     def _install_mpls_path(
         self, path: List[int], src_ip: str, dst_ip: str, label: int
     ) -> None:
-        # Transit P nodes
         for i in range(len(path) - 2, 0, -1):
-            dpid = path[i]
-            dp = self.datapaths[dpid]
-            ofproto = dp.ofproto
-            parser = dp.ofproto_parser
+            self._install_p_forward(path, i, label)
+        self._install_pe_push(path, src_ip, dst_ip, label)
 
-            match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=label)
-            actions = [parser.OFPActionOutput(self.neigh[dpid][path[i + 1]])]
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-            self._add_flow(
-                dp=dp, table_id=0, priority=PRIO_MPLS, match=match, instructions=inst
-            )
-
-        # Ingress PE node
+    def _install_pe_push(
+        self, path: List[int], src_ip: str, dst_ip: str, label: int
+    ) -> None:
         dpid = path[0]
         dp = self.datapaths[dpid]
         ofproto = dp.ofproto
@@ -556,7 +566,19 @@ class MplsControllerBasic(app_manager.RyuApp):
             dp=dp, table_id=1, priority=PRIO_MPLS, match=match, instructions=inst
         )
 
-    def _install_egress_pop_rule(self, dpid: int, host_port: int) -> None:
+    def _install_p_forward(self, path: List[int], i: int, label: int) -> None:
+        dpid = path[i]
+        dp = self.datapaths[dpid]
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
+        match = parser.OFPMatch(eth_type=ETH_TYPE_MPLS, mpls_label=label)
+        actions = [parser.OFPActionOutput(self.neigh[dpid][path[i + 1]])]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        self._add_flow(
+            dp=dp, table_id=0, priority=PRIO_MPLS, match=match, instructions=inst
+        )
+
+    def _install_pe_pop(self, dpid: int, host_port: int) -> None:
         dp = self.datapaths[dpid]
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
