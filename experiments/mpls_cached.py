@@ -14,8 +14,11 @@ from metrics.collector import MetricsCollector
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 RESULTS_DIR = "results/mpls_cached/"
 LOGS_DIR = "results/mpls_cached/logs"
+SNOOP_LOGS_DIR = "results/mpls_cached/snoop_logs"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(SNOOP_LOGS_DIR, exist_ok=True)
+
 
 PE_SWITCHES = ["Gdansk", "Rzeszow", "Wroclaw", "Szczecin"]
 
@@ -23,8 +26,8 @@ PE_SWITCHES = ["Gdansk", "Rzeszow", "Wroclaw", "Szczecin"]
 def start_ryu(env):
     return subprocess.Popen(
         ["ryu-manager", "mpls_controller_cached.py", "--observe-links"],
-        # stdout=subprocess.DEVNULL,
-        # stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         env=env,
     )
 
@@ -89,7 +92,8 @@ def run_experiment(run_id):
             throughput_csv=f"{RESULTS_DIR}/throughput_{run_id}.csv",
             flow_csv=f"{RESULTS_DIR}/flows_{run_id}.csv",
             control_csv=f"{RESULTS_DIR}/control_{run_id}.csv",
-            duration=60,
+            cpu_csv=f"{RESULTS_DIR}/cpu_{run_id}.csv",
+            duration=120,
             interval=1,
         )
 
@@ -108,8 +112,9 @@ def run_cli():
 
 if __name__ == "__main__":
     setLogLevel("info")
-
-    RUNS = 3
+    # env = os.environ.copy()
+    # env["RUN_ID"] = str(0)
+    RUNS = 20
 
     for run_id in range(1, RUNS + 1):
         env = os.environ.copy()
@@ -119,11 +124,11 @@ if __name__ == "__main__":
 
         subprocess.run(["sudo", "mn", "-c"])
 
-        time.sleep(5)
+        time.sleep(3)
 
         ryu_proc = start_ryu(env)
 
-        time.sleep(8)
+        time.sleep(5)
 
         try:
             run_experiment(run_id)
@@ -133,7 +138,7 @@ if __name__ == "__main__":
 
     subprocess.run(["sudo", "mn", "-c"])
 
-    # ryu_proc = start_ryu()
+    # ryu_proc = start_ryu(env)
     # run_cli()
     # stop_ryu(ryu_proc)
 
