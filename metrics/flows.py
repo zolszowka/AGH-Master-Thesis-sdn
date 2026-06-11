@@ -21,18 +21,45 @@ class FlowMonitor:
                 data[sw.name] = 0
                 continue
 
-            count = sum(1 for line in result.stdout.splitlines() if "table=" in line)
+            flows = []
+            durations = []
 
-            data[sw.name] = count
+            for line in result.stdout.splitlines():
+                if "table=" in line:
+                    flows.append(line)
+
+                    if "duration=" in line:
+                        try:
+                            d = float(line.split("duration=")[1].split("s")[0])
+                            durations.append(d)
+                        except:
+                            pass
+
+            data[sw.name] = {
+                "flow_count": len(flows),
+                "avg_duration": sum(durations)/len(durations) if durations else 0,
+                "max_duration": max(durations) if durations else 0
+            }
 
         return data
 
     def compute_stats(self, flow_entries):
-        sum_pe = sum(flow_entries.get(sw, 0) for sw in self.pe_switches)
+        sum_pe = 0
+        p_vals = []
 
-        p_values = [flow_entries.get(sw, 0) for sw in self.p_switches]
+        for sw in self.pe_switches:
+            if sw in flow_entries:
+                sum_pe += flow_entries[sw]["flow_count"]
 
-        avg_p = sum(p_values) / len(p_values) if p_values else 0
-        max_p = max(p_values) if p_values else 0
+        for sw in self.p_switches:
+            if sw in flow_entries:
+                p_vals.append(flow_entries[sw]["flow_count"])
 
-        return {"sum_pe": sum_pe, "avg_p": avg_p, "max_p": max_p}
+        avg_p = sum(p_vals) / len(p_vals) if p_vals else 0
+        max_p = max(p_vals) if p_vals else 0
+
+        return {
+            "sum_pe": sum_pe,
+            "avg_p": avg_p,
+            "max_p": max_p
+        }

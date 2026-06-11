@@ -6,27 +6,25 @@ from scipy import stats
 import matplotlib.pyplot as plt
 
 # =========================
-# folders
+# 1. Data folders
 # =========================
 folders = {
-    "mpls_basic": "Podstawowy",
-    "mpls_cached": "Rozszerzony",
-    "single_path": "Single_Path",
+    "basic": "mpls_basic",
+    "cached": "mpls_cached",
+    "single_path": "single_path",
 }
 
-TARGET_METRIC = "TOTAL_ALL_SWITCHES"
+TARGET_METRIC = "TOTAL"
 
 all_rows = []
 
 # =========================
-# LOAD
+# 2. Load data from folders
 # =========================
-for folder, scenario_name in folders.items():
+for label, folder in folders.items():
 
     files = glob.glob(os.path.join(folder, "control_*.csv"))
-
     for file in files:
-
         df = pd.read_csv(file)
         df.columns = df.columns.str.strip()
 
@@ -37,79 +35,85 @@ for folder, scenario_name in folders.items():
             continue
 
         for _, row in df.iterrows():
-            all_rows.append({
-                "scenario": scenario_name,
-                "value": row["flow_mod"],
-                "packet_in": row["packet_in"]
-            })
+            all_rows.append(
+                {
+                    "scenario": label,
+                    "flow_mod": row["flow_mod"],
+                    "packet_in": row["packet_in"],
+                    "packet_out": row["packet_out"],
+                }
+            )
 
 all_data = pd.DataFrame(all_rows)
 
 if all_data.empty:
-    raise ValueError("Brak danych!")
+    raise ValueError("No data loaded")
 
 # =========================
-# CI
+# 3. Mean, standard deviation and confidence interval
 # =========================
-def mean_std_ci(x):
-    x = pd.Series(x).dropna()
-    n = len(x)
+def mean_std_ci(group, column, confidence=0.95):
+    data = group[column].dropna()
+    n = len(data)
 
-    mean = x.mean()
-    std = x.std(ddof=1)
+    mean = data.mean()
+    std = data.std(ddof=1)
 
     if n < 2:
         return mean, std, (np.nan, np.nan)
 
     se = std / np.sqrt(n)
-    t = stats.t.ppf(0.975, df=n - 1)
+    t_crit = stats.t.ppf((1 + confidence) / 2, df=n - 1)
 
-    return mean, std, (mean - t * se, mean + t * se)
+    ci = (mean - t_crit * se, mean + t_crit * se)
+
+    return mean, std, ci
+
 
 # =========================
-# TABLE
+# 4. Table
 # =========================
+scenarios = {"basic": "Wariant I", "cached": "Wariant II", "single_path": "Single Path"}
+
 rows = []
 
-for scenario in folders.values():
+for scenario in scenarios.keys():
 
     subset = all_data[all_data["scenario"] == scenario]
 
-    mean, std, (low, high) = mean_std_ci(subset["value"])
+    # FLOW_MOD
+    flow_mean, flow_std, (flow_low, flow_high) = mean_std_ci(subset, "flow_mod")
 
-    packet_mean = subset["packet_in"].mean()
+    # PACKET_IN
+    pin_mean, pin_std, (pin_low, pin_high) = mean_std_ci(subset, "packet_in")
 
-    rows.append({
-        "Scenariusz": scenario,
-        "FLOW_MOD": f"{mean:.1f} ± {(high - mean):.1f}",
-        "PACKET_IN": f"{packet_mean:.1f}"
-    })
+    # PACKET_OUT
+    pout_mean, pout_std, (pout_low, pout_high) = mean_std_ci(subset, "packet_out")
+
+    rows.append(
+        {
+            "Algorytm": scenario,
+            "FLOW_MOD": f"{flow_mean:.2f} ± {(flow_high - flow_low)/2:.2f}",
+            "PACKET_IN": f"{pin_mean:.2f} ± {(pin_high - pin_low)/2:.2f}",
+            "PACKET_OUT": f"{pout_mean:.2f} ± {(pout_high - pout_low)/2:.2f}",
+        }
+    )
 
 table_df = pd.DataFrame(rows)
 
 # =========================
-# SAVE CSV
+# 5. Save CSV
 # =========================
 table_df.to_csv("control_all_switches.csv", index=False)
 
 # =========================
-# SAVE PNG
+# 6. Save PNG
 # =========================
 fig, ax = plt.subplots(figsize=(8, 2.5))
 ax.axis("off")
 
-ax.set_title(
-    "Liczba komunikatów FLOW_MOD i PACKET_IN",
-    fontsize=14,
-    fontweight="bold",
-    pad=20
-)
-
 table = ax.table(
-    cellText=table_df.values,
-    colLabels=table_df.columns,
-    cellLoc="center",
-    loc="center"
+    cellText=table_df.values, colLabels=table_df.columns, cellLoc="center", loc="center"
 )
 
 table.auto_set_font_size(False)

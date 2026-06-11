@@ -5,113 +5,129 @@ import csv
 import numpy as np
 from collections import defaultdict
 from scipy import stats
+import pandas as pd
 
 
-class LinksMonitor:
-    def __init__(self, logs_dir):
-        self.logs_dir = logs_dir
+# =========================
+# Parse logs
+# =========================
+def parse_runs(logs_dir):
+    all_samples = defaultdict(list)
+    run_peaks = defaultdict(list)
 
-    def parse_runs(self):
-        all_samples = defaultdict(list)
-        run_peaks = defaultdict(list)
+    pattern = re.compile(r"dpid=(\d+)\s+port=(\d+)\s+throughput=([\d.]+)")
 
-        pattern = re.compile(r"dpid=(\d+)\s+port=(\d+)\s+throughput=([\d.]+)")
+    log_files = sorted(glob.glob(os.path.join(logs_dir, "*.log")))
 
-        log_files = sorted(glob.glob(os.path.join(self.logs_dir, "*.log")))
+    for path in log_files:
+        run_samples = defaultdict(list)
 
-        for path in log_files:
-            run_samples = defaultdict(list)
+        with open(path) as f:
+            for line in f:
+                m = pattern.search(line)
+                if not m:
+                    continue
 
-            with open(path) as f:
-                for line in f:
-                    m = pattern.search(line)
-                    if not m:
-                        continue
+                key = (int(m.group(1)), int(m.group(2)))
+                run_samples[key].append(float(m.group(3)))
 
-                    key = (int(m.group(1)), int(m.group(2)))
-                    run_samples[key].append(float(m.group(3)))
+        for key, values in run_samples.items():
+            all_samples[key].extend(values)
+            run_peaks[key].append(max(values))
 
-            for key, values in run_samples.items():
-                all_samples[key].extend(values)
-                run_peaks[key].append(max(values))
+    return all_samples, run_peaks
 
-        return all_samples, run_peaks
 
-    def ci95(self, data):
-        n = len(data)
-        if n < 2:
-            return np.mean(data), 0.0
+# =========================
+# Mean, standard deviation and confidence interval
+# =========================
+def mean_std_ci(data, confidence=0.95):
+    data = pd.Series(data).dropna()
+    n = len(data)
 
-        mean = np.mean(data)
-        std = np.std(data, ddof=1)
+    mean = data.mean()
+    std = data.std(ddof=1)
 
-        t_val = stats.t.ppf(0.975, df=n - 1)
-        margin = t_val * std / np.sqrt(n)
+    if n < 2:
+        return mean, std, (np.nan, np.nan)
 
-        return mean, margin
+    se = std / np.sqrt(n)
+    t_crit = stats.t.ppf((1 + confidence) / 2, df=n - 1)
 
-    def analyze(self):
-        all_samples, run_peaks = self.parse_runs()
+    ci = (mean - t_crit * se, mean + t_crit * se)
 
-        results = []
+    return mean, std, ci
 
-        for key in sorted(all_samples):
-            dpid, port = key
 
-            samples = all_samples[key]
-            peaks = run_peaks[key]
+# =========================
+# Analyze single scenario
+# =========================
+def analyze_logs(logs_dir):
+    all_samples, run_peaks = parse_runs(logs_dir)
 
-            avg, ci = self.ci95(samples)
+    results = []
 
-            results.append([
+    for key in sorted(all_samples):
+        dpid, port = key
+
+        samples = all_samples[key]
+        peaks = run_peaks[key]
+
+        avg, std, (avg_low, avg_high) = mean_std_ci(samples)
+        peak_mean, std, (peak_low, peak_high) = mean_std_ci(peaks)
+
+        results.append(
+            [
                 dpid,
                 port,
-                round(avg, 4),
-                round(ci, 4),
-                round(np.mean(peaks), 4),
-                round(np.std(peaks, ddof=1), 4),
-            ])
+                round(avg, 2),
+                round((avg_high - avg_low) / 2, 2),
+                round(peak_mean, 2),
+                round((peak_high - peak_low) / 2, 2),
+            ]
+        )
 
-        return results
+    return results
 
 
-def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+# =========================
+# Save CSV
+# =========================
+base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    scenarios = {
-        "mpls_basic": os.path.join(base_dir, "mpls_basic/logs"),
-        "mpls_cached": os.path.join(base_dir, "mpls_cached/logs"),
-        "single_path": os.path.join(base_dir, "single_path/logs"),
-    }
+scenarios = {
+    "mpls_basic": os.path.join(base_dir, "mpls_basic/logs"),
+    "mpls_cached": os.path.join(base_dir, "mpls_cached/logs"),
+    "single_path": os.path.join(base_dir, "single_path/logs"),
+}
 
-    output_file = os.path.join(base_dir, "links_results.csv")
+output_file = os.path.join(base_dir, "links_results.csv")
 
-    with open(output_file, "w", newline="") as f:
-        writer = csv.writer(f)
+with open(output_file, "w", newline="") as f:
+    writer = csv.writer(f)
 
-        writer.writerow([
+    writer.writerow(
+        [
             "scenario",
             "dpid",
             "port",
             "avg_mbps",
-            "ci95_mbps",
+            "ci95_avg",
             "avg_peak",
-            "std_peak"
-        ])
+            "std_peak",
+            "ci95_peak",
+        ]
+    )
 
-        for scenario, path in scenarios.items():
-            if not os.path.exists(path):
-                print(f"[WARN] missing: {path}")
-                continue
+    for scenario, path in scenarios.items():
 
-            monitor = LinksMonitor(path)
-            results = monitor.analyze()
+        if not os.path.exists(path):
+            print(f"[WARN] missing: {path}")
+            continue
 
-            for row in results:
-                writer.writerow([scenario] + row)
+        results = analyze_logs(path)
 
-    print(f"[OK] saved: {output_file}")
+        for row in results:
+            writer.writerow([scenario] + row)
 
-
-if __name__ == "__main__":
-    main()
+print(f"Saved: links_results.csv")
