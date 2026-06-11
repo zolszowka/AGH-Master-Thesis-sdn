@@ -15,7 +15,7 @@
 			<param name="sigma" value="1.01" />
         </flow-length>
         <packet-inter-arrival-time distribution="exponential">
-            <param name="mean" value="10" />
+            <param name="mean" value="1" />
         </packet-inter-arrival-time>
         <payload-size distribution="normal">
             <param name="mu" value="1358" />
@@ -34,7 +34,7 @@
 			<param name="sigma" value="1.01" />
         </flow-length>
         <packet-inter-arrival-time distribution="exponential">
-            <param name="mean" value="10" />
+            <param name="mean" value="1" />
         </packet-inter-arrival-time>
         <payload-size distribution="normal">
             <param name="mu" value="158" />
