@@ -60,10 +60,17 @@ class MplsControllerBasic(app_manager.RyuApp):
 
         hub.spawn(self._monitor_stats)
 
-        run_id = os.environ.get("RUN_ID", "0")
+        run_id = os.environ.get("RUN_ID") or str(int(time.time()))
         log_file = os.path.join(LOGS_DIR, f"stats_mpls_basic_{run_id}.log")
-        fh = logging.FileHandler(log_file)
+
+        self.logger = logging.getLogger(f"mpls_{run_id}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+
+        self.logger.handlers.clear()
         self.logger.addHandler(fh)
 
     # -----------------------------------------------------------------------
@@ -166,12 +173,15 @@ class MplsControllerBasic(app_manager.RyuApp):
             dt = now - prev_time
             dbytes = total - prev_bytes
 
-            if dt <= 0 or dbytes <= 0:
+            if dt < 0.1 or dbytes <= 0:
                 continue
 
             throughput_bps = (dbytes * 8.0) / dt
 
-            throughput_mbps = (dbytes * 8.0) / (dt * 1e6)
+            throughput_mbps = throughput_bps / 1e6
+            if throughput_mbps > 100000.0:
+                continue
+
             self.logger.info(
                 f"STATS dpid={dpid} port={port_no} "
                 f"throughput={throughput_mbps:.3f} Mbps"
@@ -335,7 +345,6 @@ class MplsControllerBasic(app_manager.RyuApp):
 
     def _classify_state(self, throughput_bps: float) -> str:
         throughput_mbps = throughput_bps / 1e6
-        self.logger.info(f"{throughput_mbps} Mbps")
         if throughput_mbps >= CONG_TH:
             return "CONG"
         if throughput_mbps >= WARN_TH:

@@ -39,12 +39,28 @@ class SinglePathController(app_manager.RyuApp):
         self.neigh: Dict[int, Dict[int, int]] = {}  # {dpid: {neighbor_dpid: port}}
         self.net = nx.Graph()
 
+        self.port_stats: Dict[
+            Tuple[int, int], Tuple[int, int]
+        ] = {}  # {(dpid, port_no): (total, now)}
+        self.link_stats: Dict[
+            Tuple[int, int], Dict[str, float | str]
+        ] = {}  # {(src, dst): {'state': 'NORM', 'throughput_bps': 0.0}}
+
+        self._installing: set = set()
+
         hub.spawn(self._monitor_stats)
 
-        run_id = os.environ.get("RUN_ID", "0")
+        run_id = os.environ.get("RUN_ID") or str(int(time.time()))
         log_file = os.path.join(LOGS_DIR, f"stats_single_path_{run_id}.log")
-        fh = logging.FileHandler(log_file)
+
+        self.logger = logging.getLogger(f"single_path_{run_id}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+
+        self.logger.handlers.clear()
         self.logger.addHandler(fh)
 
     # -----------------------------------------------------------------------
@@ -92,6 +108,8 @@ class SinglePathController(app_manager.RyuApp):
             udp_pkt = pkt.get_protocol(udp.udp)
 
             if udp_pkt:
+                if udp_pkt.dst_port < 10000:
+                    return
                 self._handle_udp(ip_pkt, udp_pkt, msg)
                 return
 
@@ -112,8 +130,6 @@ class SinglePathController(app_manager.RyuApp):
             new_neigh.setdefault(src, {})[dst] = src_port
             new_net.add_edge(src, dst, weight=1)
 
-        if new_neigh == self.neigh or len(new_neigh) <= len(self.neigh):
-            return
         self.neigh = new_neigh
         self.net = new_net
 
@@ -142,10 +158,14 @@ class SinglePathController(app_manager.RyuApp):
             dt = now - prev_time
             dbytes = total - prev_bytes
 
-            if dt <= 0 or dbytes <= 0:
+            if dt < 0.1 or dbytes <= 0:
                 continue
 
             throughput_mbps = (dbytes * 8.0) / (dt * 1e6)
+
+            if throughput_mbps > 100000.0:
+                continue
+
             self.logger.info(
                 f"STATS dpid={dpid} port={port_no} "
                 f"throughput={throughput_mbps:.3f} Mbps"
@@ -245,6 +265,10 @@ class SinglePathController(app_manager.RyuApp):
 
         dp.send_msg(out)
 
+    # -----------------------------------------------------------------------
+    # Path Calculation and Flow Installation
+    # -----------------------------------------------------------------------
+
     def _calculate_path(self, src: int, dst: int) -> Optional[List[int]]:
         try:
             return nx.shortest_path(self.net, src, dst, weight="weight")
@@ -254,18 +278,28 @@ class SinglePathController(app_manager.RyuApp):
     def _handle_ip(self, ip_pkt: ipv4.ipv4, msg: Any) -> None:
         src_ip = ip_pkt.src
         dst_ip = ip_pkt.dst
-        dpid = msg.datapath.id
+
+        if src_ip not in self.hosts or dst_ip not in self.hosts:
+            return
+
+        key = (src_ip, dst_ip)
+        if key in self._installing:
+            return
+        self._installing.add(key)
 
         src_dpid, src_port, _ = self.hosts[src_ip]
         dst_dpid, dst_port, _ = self.hosts[dst_ip]
 
         path = self._calculate_path(src_dpid, dst_dpid)
         if not path:
+            self._installing.discard(key)
             return
 
-        if dpid == src_dpid:
-            self._install_icmp_path(path, src_ip, dst_ip, dst_port)
+        self._install_icmp_path(path, src_ip, dst_ip, dst_port)
 
+        reverse_key = (dst_ip, src_ip)
+        if reverse_key not in self._installing:
+            self._installing.add(reverse_key)
             reverse_path = list(reversed(path))
             self._install_icmp_path(reverse_path, dst_ip, src_ip, src_port)
 
@@ -276,18 +310,42 @@ class SinglePathController(app_manager.RyuApp):
         dst_ip = ip_pkt.dst
         src_udp = udp_pkt.src_port
         dst_udp = udp_pkt.dst_port
-        dpid = msg.datapath.id
 
-        src_dpid, _, _ = self.hosts[src_ip]
-        dst_dpid, dst_port, _ = self.hosts[dst_ip]
-
-        path = self._calculate_path(src_dpid, dst_dpid)
-        if not path:
+        if src_ip not in self.hosts or dst_ip not in self.hosts:
             return
 
-        if dpid == src_dpid:
+        key = (src_ip, dst_ip, dst_udp)
+        if key in self._installing:
+            src_dpid, _, _ = self.hosts[src_ip]
+            dst_dpid, dst_port, _ = self.hosts[dst_ip]
+            path = self._calculate_path(src_dpid, dst_dpid)
+            if path:
+                self._forward_packet(msg, path, dst_port)
+            return
+
+        self._installing.add(key)
+
+        try:
+            src_dpid, _, _ = self.hosts[src_ip]
+            dst_dpid, dst_port, _ = self.hosts[dst_ip]
+
+            path = self._calculate_path(src_dpid, dst_dpid)
+            if not path:
+                return
+
             self._install_udp_path(path, src_ip, dst_ip, src_udp, dst_udp, dst_port)
             self._forward_packet(msg, path, dst_port)
+            hub.spawn_after(0.5, self._remove_from_installing, key)
+        except Exception as e:
+            self.logger.error(f"Error: {e}")
+            self._installing.discard(key)
+
+    def _remove_from_installing(self, key: tuple) -> None:
+        self._installing.discard(key)
+
+    # -----------------------------------------------------------------------
+    # Packet forwarding
+    # -----------------------------------------------------------------------
 
     def _forward_packet(self, msg: Any, path: List[int], final_port: int) -> None:
         dp = msg.datapath
@@ -308,15 +366,23 @@ class SinglePathController(app_manager.RyuApp):
         if out_port is None:
             return
 
+        data = None
+        if msg.buffer_id == dp.ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
         actions = [parser.OFPActionOutput(out_port)]
         out = parser.OFPPacketOut(
             datapath=dp,
             buffer_id=msg.buffer_id,
             in_port=msg.match["in_port"],
             actions=actions,
-            data=msg.data,
+            data=data,
         )
         dp.send_msg(out)
+
+    # -----------------------------------------------------------------------
+    # Flow installation
+    # -----------------------------------------------------------------------
 
     def _install_icmp_path(
         self, path: List[int], src_ip: str, dst_ip: str, final_port: int
@@ -351,6 +417,9 @@ class SinglePathController(app_manager.RyuApp):
         dst_port: int,
         final_port: int,
     ) -> None:
+        self.logger.info(
+            f"Installing path {src_ip} -> {dst_ip} port {dst_port}: {path}"
+        )
         for i in range(len(path) - 1, -1, -1):
             dpid = path[i]
             dp = self.datapaths[dpid]
@@ -367,7 +436,6 @@ class SinglePathController(app_manager.RyuApp):
                 ipv4_src=src_ip,
                 ipv4_dst=dst_ip,
                 ip_proto=17,
-                udp_src=src_port,
                 udp_dst=dst_port,
             )
             actions = [parser.OFPActionOutput(out_port)]
@@ -379,7 +447,7 @@ class SinglePathController(app_manager.RyuApp):
                 priority=PRIO_UDP,
                 match=match,
                 instructions=inst,
-                idle_timeout=30,
+                idle_timeout=3,
             )
 
     def _add_flow(
