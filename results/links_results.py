@@ -114,7 +114,6 @@ with open(output_file, "w", newline="") as f:
             "avg_mbps",
             "ci95_avg",
             "avg_peak",
-            "std_peak",
             "ci95_peak",
         ]
     )
